@@ -1,4 +1,6 @@
 # Context-Aware Payload Mutator (CAPM)
+<img width="1196" height="792" alt="Screenshot (32)" src="https://github.com/user-attachments/assets/1b3e00f8-e777-4047-b196-1ff6f58e7e9c" />
+
 
 A red team tool that **analyzes HTTP response context** and generates intelligent, context-specific payloads — instead of spraying generic wordlists.
 
